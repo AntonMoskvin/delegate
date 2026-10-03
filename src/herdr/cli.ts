@@ -121,6 +121,50 @@ function spawnPolicyCommand(command: string, args: string[], platform: NodeJS.Pl
 	return { command, args };
 }
 
+/**
+ * DOGFOOD_FIX (LLM_Pipeline, 2026-10-03): cmd.exe mangles cmd metacharacters
+ * (<, >) inside winQuoteArg-quoted arguments — a delegate prompt containing
+ * `<verb>` became an INPUT REDIRECTION, and herdr failed with the localized
+ * Windows error "Не удалось открыть входной файл" (E_PROMPT_STALLED on every
+ * prompt whose text contained angle brackets). Repro: runHerdr(["agent",
+ * "prompt", name, "тест с `<verb>`"]) — FAIL; same text without `<` — OK.
+ *
+ * Why: the win32 cmd.exe launch policy exists for npm .cmd SHIMS (CVE-2024-27980
+ * EINVAL without a shell). herdr 0.9.x standalone is a NATIVE herdr.exe —
+ * CreateProcess passes argv natively, no cmd.exe parsing, no metacharacter
+ * mangling. So: on win32, resolve the command through `where`; when it lands
+ * on a native .exe, spawn it DIRECTLY (no cmd.exe layer at all). Anything else
+ * (.cmd shim, extensionless stub, `where` unavailable) falls back to the old
+ * cmd.exe policy — byte-identical to the pre-fix shape, so W.2-style tests and
+ * shim installs keep working.
+ *
+ * Input: command — CLI binary name as invoked on POSIX; env — the env the
+ *   spawn will use (the `where` lookup must match the spawn's PATH)
+ * Output: the spawn policy for THAT platform + env, or null while resolution
+ *   is pending/failed (caller falls back to spawnPolicyCommand)
+ * Raises: never (any resolution failure degrades to the old policy)
+ */
+export async function resolveNativeWin32Command(
+	command: string,
+	env?: NodeJS.ProcessEnv,
+): Promise<SpawnPolicy | null> {
+	try {
+		const { execFile } = await import("node:child_process");
+		const { promisify } = await import("node:util");
+		const { stdout } = await promisify(execFile)("where", [command], {
+			...(env ? { env } : {}),
+			windowsHide: true,
+		}).catch(() => ({ stdout: "" } as { stdout: string }));
+		const first = stdout.split(/\r?\n/).map((l) => l.trim()).find(Boolean);
+		if (first && first.toLowerCase().endsWith(".exe")) {
+			return { command: first, args: [] }; // args filled by the caller
+		}
+		return null;
+	} catch {
+		return null;
+	}
+}
+
 // ---------------------------------------------------------------------------
 // CLI plumbing
 // ---------------------------------------------------------------------------
@@ -255,10 +299,18 @@ function herdrSpawnError(args: string[], fields: { message: string; code?: unkno
  *   the escalation (child.kill("SIGKILL") cannot reach herdr's own children).
  */
 function spawnHerdr(args: string[], timeoutMs: number, platform: NodeJS.Platform = DEFAULT_PLATFORM, env?: NodeJS.ProcessEnv): Promise<HerdrRunResult> {
-	return new Promise((resolve, reject) => {
+	return (async () => {
+		// DOGFOOD_FIX: native herdr.exe on win32 spawns DIRECTLY (no cmd.exe layer,
+		// no metacharacter mangling — see resolveNativeWin32Command); anything else
+		// falls back to the cmd.exe shim policy, byte-identical to the pre-fix shape.
+		let policy = spawnPolicyCommand("herdr", args, platform);
+		if (platform === "win32") {
+			const native = await resolveNativeWin32Command("herdr", env);
+			if (native) policy = { command: native.command, args };
+		}
+		return new Promise((resolve, reject) => {
 		// Platform policy applied HERE and in armSigkill only — the rest of the
 		// lifecycle (timeout shape, stdio destruction, error mapping) is shared.
-		const policy = spawnPolicyCommand("herdr", args, platform);
 		// Issue #25: an explicit env (the spawn flow's swarm identity) replaces
 		// the inherited process environment for this CLI call; absent → inherit.
 		const child = spawn(policy.command, policy.args, {
@@ -407,7 +459,8 @@ function spawnHerdr(args: string[], timeoutMs: number, platform: NodeJS.Platform
 			}
 			failLike({ message: `Command failed: herdr ${args.join(" ")}\n${stderr}`, code, killed: false, signal });
 		});
-	});
+		});
+	})();
 }
 
 /**
